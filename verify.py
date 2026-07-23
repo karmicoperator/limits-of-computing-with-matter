@@ -1,426 +1,955 @@
 #!/usr/bin/env python3
-"""Verification script for "The Limits of Computing with Matter" (Amberg, 2026).
+"""Verification supplement for The Limits of Computing with Matter, package v4.0.
 
-Recomputes every load-bearing derived value in the paper (derived is the
-paper's untagged default state) from the postulates P1-P9 and the tagged
-inputs, and checks it against the value as printed (tolerances cover the
-paper's rounding). Sections below mirror the
-paper's sections. Run:  python3 verify.py     (standard library only)
+This program recomputes the derived numerical claims identified in the paper,
+checks the formulae through independent identities, exercises the effective-work
+bounds with deterministic property tests, and verifies that the LaTeX source
+contains the corresponding rounded values.
 
-Exit code 0 iff every check passes.
-
-Provenance of inputs:
-  [measured]  experimental/industrial fact, verified against live sources
-              on 2026-07-18 (see bibliography note in the paper)
-  [estimated] engineering judgment with stated range
-  [chosen]    free design parameter
-  [projected] extrapolation beyond demonstrated practice
-[estimated]/[chosen]/[projected] values are INPUTS of this script, not outputs;
-their ranges are exercised in the S13/S13.1 sections.
+It verifies mathematical arithmetic and manuscript synchronization. It does not
+validate cited source data, fabrication, cooling closure, a physical compute
+primitive, trained-model quality, economics, or achieved performance.
 """
+
+from __future__ import annotations
+
+import argparse
+import json
 import math
-import subprocess
+import random
+import re
 import sys
+from decimal import Decimal, ROUND_HALF_UP
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Callable
 
-# ---- physical constants (CODATA) ----
-k    = 1.380649e-23     # J/K (exact)
-q    = 1.602177e-19     # C
-h    = 6.62607e-34      # J s
-hbar = 1.054572e-34
-me   = 9.10938e-31      # kg
-eps0 = 8.8542e-12       # F/m
-mu0  = 4e-7 * math.pi
-c    = 2.9979e8
-NA   = 6.02214e23
+PACKAGE_VERSION = "4.0"
+PAPER_TITLE = "The Limits of Computing with Matter"
 
-FAIL, NCHK = [], [0]
-def chk(name, got, printed, tol=0.05):
-    ok = abs(got / printed - 1) < tol
-    NCHK[0] += 1
-    print(f"  {'PASS' if ok else 'FAIL'}  {name}: computed {got:.4g}, printed {printed:.4g}")
-    if not ok:
-        FAIL.append(name)
 
-def inrange(name, got, lo, hi, slack=0.10):
-    """Value printed as a range: computed must fall within [lo,hi] +- slack."""
-    ok = lo * (1 - slack) <= got <= hi * (1 + slack)
-    NCHK[0] += 1
-    print(f"  {'PASS' if ok else 'FAIL'}  {name}: computed {got:.4g}, printed range [{lo:.3g}, {hi:.3g}]")
-    if not ok:
-        FAIL.append(name)
+@dataclass(frozen=True)
+class Cube:
+    side_m: float = 27.5e-3
+    leaves: int = 170
+    leaf_thickness_m: float = 100e-6
+    gap_m: float = 50e-6
+    pitch_m: float = 130e-9
+    silicon_density_kg_m3: float = 2329.0
+    silicon_molar_mass_kg_mol: float = 28.0855e-3
+    avogadro_mol_inv: float = 6.02214076e23
 
-def order(name, got, printed, dex=0.7):
-    """Order-of-magnitude claim: |log10(got/printed)| <= dex (two-sided)."""
-    ok = abs(math.log10(got / printed)) <= dex
-    NCHK[0] += 1
-    print(f"  {'PASS' if ok else 'FAIL'}  {name}: computed {got:.4g}, printed ~{printed:.4g} (order check)")
-    if not ok:
-        FAIL.append(name)
+    @property
+    def gaps(self) -> int:
+        return self.leaves - 1
 
-# Note on check depth: some checks below are one-step arithmetic on tagged
-# inputs (e.g. duty x planes, cluster count x 700 W). They exist to catch
-# transcription errors between derivation and print, not to prove physics;
-# the multi-step chains (energy chain, ladder rungs, de-rating) are the
-# substantive recomputations.
+    @property
+    def internal_faces(self) -> int:
+        return 2 * self.gaps
 
-# =====================================================================
-# S2/S4  Postulates and the energy chain (OP-E: 400 K, 100 MHz, eps=1e-3)
-# =====================================================================
-T, f, eps = 400.0, 1e8, 1e-3
-kT  = k * T
-nu0 = kT / h                       # P1 attempt rate [transition-state heuristic]
-Lam = math.log(nu0 / (f * eps))
-print("S4  Energy chain (400 K, 100 MHz, eps=1e-3)")
-chk("nu0 [1/s]", nu0, 8.3e12)
-chk("Lambda", Lam, 18.2, 0.01)
-Vmin = kT / q * Lam
-chk("V_min at n=1 [V]", Vmin, 0.63, 0.01)
-Cmin = q * q / kT
-chk("C_min [aF]", Cmin * 1e18, 4.65, 0.01)
-n_ideal = 1.3                       # [estimated 1.2-1.5], S12 geometry
-chk("electron count n*Lambda (upper)", n_ideal * Lam, 24, 0.02)
-chk("electron count at n=1 (lower)", Lam, 18, 0.02)
-chk("P1 attempt-rate term ln(nu0/f)", math.log(nu0 / f), 11.3, 0.05)
-chk("nu0 sensitivity: +-10x -> dLambda", math.log(10), 2.3, 0.02)
+    @property
+    def cube_volume_m3(self) -> float:
+        return self.side_m**3
 
-# S12 cell: cylindrical annulus, channel outer r=30 nm, hole r=45 nm,
-# ONO eps_r ~ 5 [estimated], gate height 35 nm
-Ccell = 2 * math.pi * eps0 * 5 * 35e-9 / math.log(45 / 30)
-chk("C_cell [aF]", Ccell * 1e18, 24.0, 0.02)
-chk("C_cell/C_min", Ccell / Cmin, 5.2, 0.01)
-eta = 10                            # charge recovery [projected; demonstrated 2-3]
-R   = 1                             # wiring ratio [estimated, systolic]
-E_floor = 0.5 * (1 + R) * kT * Lam**2 / eta
-E_cell  = E_floor * (Ccell / Cmin) * n_ideal**2
-chk("floor 0.5(1+R)kT L^2/eta [eV]", E_floor / q, 1.15, 0.01)
-chk("E_op cell [J]", E_cell, 1.60e-18, 0.01)
-chk("E_op cell [eV]", E_cell / q, 10.0, 0.01)
-# S4.4 bookkeeping deltas that separate the published floors
-chk("Poisson/equilibrium floor ratio (= Lambda)", Lam, 18, 0.02)
-inrange("no-attempt-rate floor lower by", (Lam / math.log(1 / eps))**2, 5, 7)
+    @property
+    def active_solid_volume_m3(self) -> float:
+        return self.side_m**2 * self.leaves * self.leaf_thickness_m
 
-# S4.5 waterfall
-print("S4.5 Energy waterfall")
-chk("Landauer kT ln2 [eV]", kT * math.log(2) / q, 0.024, 0.01)
-chk("barrier kT*Lambda [eV]", kT * Lam / q, 0.63, 0.01)
-chk("waterfall x26 (barrier/Landauer)", Lam / math.log(2), 26, 0.02)
-chk("waterfall x1.8 (floor/barrier)", E_floor / (kT * Lam), 1.8, 0.02)
-chk("waterfall x8.7 (cell/floor)", E_cell / E_floor, 8.7, 0.01)
+    @property
+    def stack_thickness_m(self) -> float:
+        return self.leaves * self.leaf_thickness_m + self.gaps * self.gap_m
 
-# =====================================================================
-# S9.2  Comparator (B300 Blackwell Ultra, 2025) [measured; mapping +-2x]
-# =====================================================================
-print("S9.2 Comparator (B300 Blackwell Ultra, 2025)")
-# The chain runs from the events-per-op mapping (triangulated +-2x) times the
-# measured dense-FP8 rate; the 2.25e19 ev/s anchor makes events/op exactly 5e3.
-B_P, B_fp8, B_ntr, B_f = 1400.0, 4.5e15, 208e9, 1.8e9    # [measured; f estimated]
-HX = 5e3 * B_fp8                        # 'one B300' in switch events/s
-chk("anchor events/s", HX, 2.25e19, 0.001)
-H_J = B_P / HX
-chk("J/event", H_J, 6.2e-17, 0.01)
-chk("eV/event", H_J / q, 388, 0.01)
-chk("fJ/op", B_P / B_fp8 * 1e15, 311, 0.01)
-ev_per_op = (B_P / B_fp8) / H_J
-chk("events per FP8 op", ev_per_op, 5e3, 0.001)
-chk("implied alpha [%]", HX / (B_ntr * B_f) * 100, 6, 0.02)
-# mapping triangulation (S9.2)
-chk("alpha from 3e3 ev/op [%]", 3e3 * B_fp8 / (B_ntr * B_f) * 100, 3.6, 0.02)
-chk("alpha from 1e4 ev/op [%]", 1e4 * B_fp8 / (B_ntr * B_f) * 100, 12, 0.01)
-chk("J/event at alpha x3 [eV]", H_J / q / 3, 130, 0.01)
-chk("switched C at alpha /3, 0.75 V rail [fF]", 2 * (3 * H_J) / 0.75**2 * 1e15, 0.66, 0.02)
-chk("ONO series eps_eff (5/5/5 nm ox/nit/ox)", 15 / (5/3.9 + 5/7.5 + 5/3.9), 4.6, 0.02)
-chk("waterfall x39 (B300/cell)", H_J / E_cell, 39, 0.01)
-# vintage cross-check (2022 H100, retained in [20])
-chk("H100 fJ/op", 700 / 1.979e15 * 1e15, 354, 0.01)
-chk("vintage J/op ratio (H100/B300)", (700 / 1.979e15) / (B_P / B_fp8), 1.14, 0.01)
-chk("H100 eV/event at shared mapping", (700 / 1.979e15) / 5e3 / q, 442, 0.01)
+    @property
+    def remaining_margin_m(self) -> float:
+        return self.side_m - self.stack_thickness_m
 
-# =====================================================================
-# S12  Machine counts
-# =====================================================================
-print("S12 Machine")
-a = 27.5e-3
-pil_slab = (a / 130e-9)**2
-planes = 1800                       # [projected; production ~300 in 2-3 decks]
-cells = 183 * pil_slab * planes
-chk("pillars/slab", pil_slab, 4.5e10, 0.01)
-chk("pillars cube-wide (streams, S7)", 183 * pil_slab, 8.2e12, 0.01)
-chk("cells", cells, 1.5e16, 0.02)
-chk("cells/slab", pil_slab * planes, 8.1e13, 0.01)
-chk("weights/slab [TB]", pil_slab * planes / 8 / 1e12, 10, 0.01)
-chk("weights [PB]", cells / 8 / 1e15, 1.8, 0.03)
-chk("x B300 HBM (288 GB)", cells / 8 / 288e9, 6400, 0.02)
-Lcube = 183 * 100e-6 + 183 * 50e-6      # 183 slabs + gaps (rounds to 2.75 cm)
-chk("cube edge [cm]", Lcube * 100, 2.75, 0.01)
-chk("cube volume [cm3]", Lcube * a * a * 1e6, 21, 0.02)
-Vsolid = 183 * 100e-6 * a * a
-chk("solid volume [cm3]", Vsolid * 1e6, 13.8, 0.01)
-atoms = 5.0e22 * Vsolid * 1e6           # Si-class atomic density [measured]
-chk("atoms", atoms, 6.9e23, 0.01)
-chk("atoms [mol]", atoms / NA, 1.15, 0.01)
-chk("atoms per switch", atoms / cells, 4.7e7, 0.01)
-chk("rail swing n*V_min [V]", n_ideal * Vmin, 0.82, 0.01)
-chk("rail current at 85 kW [kA]", 85e3 / 0.9 / 1e3, 94, 0.01)
-chk("per-slab current [A]", 85e3 / 0.9 / 183, 520, 0.01)
-chk("retention barrier, year-scale at bare nu0 [eV]",
-    kT * math.log(nu0 * 3.156e7) / q, 1.65, 0.03)
-# S12 cooling
-wall = 183 * 2 * a * a                  # both faces of every slab
-chk("cooled area [cm2]", wall * 1e4, 2768, 0.01)
-chk("water at 85 kW [mL/s]", 85e3 / 2.20e6 * 1e3, 39, 0.01)
-flux_ref = 85e3 / wall / 1e4
-chk("flux at reference [W/cm2]", flux_ref, 31, 0.01)
-inrange("CHF margin at reference", 300 / flux_ref, 10, 33)
-inrange("CHF margin at reference (upper)", 1000 / flux_ref, 10, 33)
+    @property
+    def external_area_m2(self) -> float:
+        return 6 * self.side_m**2
 
-# =====================================================================
-# S3/S9.3  Throughput (illustrative corollary; cell-level accounting)
-# =====================================================================
-print("S9.3 Design-point performance")
-chk("B(1.4 kW, one comparator) [ev/s]", 1400 / E_cell, 8.7e20, 0.01)
-chk("x B300 at 1.4 kW", 1400 / E_cell / HX, 39, 0.01)
-B85 = 85e3 / E_cell
-chk("B(85 kW) [ev/s]", B85, 5.3e22, 0.01)
-chk("x B300 at 85 kW", B85 / HX, 2400, 0.02)
-chk("alpha at 85 kW [%]", B85 / (cells * f) * 100, 3.6, 0.03)
-Bcap = cells * 0.1 * f                  # alpha_max = 0.1 [chosen]
-chk("B(cap) [ev/s]", Bcap, 1.5e23, 0.02)
-chk("x B300 at cap", Bcap / HX, 6600, 0.01)
-chk("P(cap) [kW]", Bcap * E_cell / 1e3, 236, 0.03)
-flux_cap = Bcap * E_cell / wall / 1e4
-chk("flux at cap [W/cm2]", flux_cap, 85, 0.03)
-inrange("CHF margin at cap", 300 / flux_cap, 3.5, 12)
-inrange("CHF margin at cap (upper)", 1000 / flux_cap, 3.5, 12)
-chk("efficiency x (error-tolerant)", H_J / E_cell, 39, 0.01)
-Lam_x = math.log(nu0 / (f * 1e-12))
-chk("Lambda(exact, eps=1e-12)", Lam_x, 39, 0.01)
-chk("exact-compute energy penalty", (Lam_x / Lam)**2, 4.6, 0.01)
-chk("efficiency x (exact)", H_J / E_cell / (Lam_x / Lam)**2, 8.5, 0.01)
-chk("idealized floor x", H_J / E_floor, 340, 0.01)
-chk("equal-throughput cluster [MW]", B85 / HX * B_P / 1e6, 3.3, 0.01)
-chk("cluster power ratio (1/39 electricity)", B85 / HX * B_P / 85e3, 39, 0.01)
-chk("-- under 4x pessimistic event count", B85 / HX * B_P / 85e3 / 4, 9.7, 0.01)
-chk("slab x B300", B85 / HX / 183, 13, 0.02)
-chk("slab power [W]", 85e3 / 183, 465, 0.01)
-chk("slab x B300 at cap", Bcap / HX / 183, 36, 0.01)
-chk("per-cell power at cap duty [pW]", E_cell * 0.1 * f * 1e12, 16, 0.01)
-chk("per-cell power at reference [pW]", E_cell * (B85 / (cells * f)) * f * 1e12, 6, 0.05)
-chk("pillar weight column [bytes]", planes / 8, 225, 0.01)
+    @property
+    def active_face_area_mm2(self) -> float:
+        return self.internal_faces * (self.side_m * 1e3) ** 2
 
-# =====================================================================
-# S5  The smallest switch (300 K, 3 GHz, eps=1e-3)
-# =====================================================================
-print("S5  Smallest switch")
-kT3  = k * 300
-nu03 = kT3 / h
-Lam3 = math.log(nu03 / (3e9 * 1e-3))
-chk("Lambda(300K,3GHz)", Lam3, 14.6, 0.01)
-Vm3  = kT3 / q * Lam3
-kap  = math.sqrt(2 * 0.19 * me * q * Vm3) / hbar   # m*=0.19 me, Si [measured]
-chk("L_min [nm]", Lam3 / (2 * kap) * 1e9, 5.3, 0.01)
-chk("C_min-sized plate gate, eps_r=10, t=1nm [nm]",
-    math.sqrt(Cmin * 1e-9 / (eps0 * 10)) * 1e9, 7, 0.05)
+    @property
+    def silicon_equivalent_mass_kg(self) -> float:
+        return self.active_solid_volume_m3 * self.silicon_density_kg_m3
 
-# =====================================================================
-# S6  Cooling bound
-# =====================================================================
-print("S6  Cooling")
-chk("internal-flux ceiling, conservative [MW]", 300e4 * wall / 1e6, 0.83, 0.01)
-chk("internal-flux ceiling, optimistic [MW]", 1000e4 * wall / 1e6, 2.77, 0.01)
+    @property
+    def silicon_equivalent_moles(self) -> float:
+        return self.silicon_equivalent_mass_kg / self.silicon_molar_mass_kg_mol
 
-# =====================================================================
-# S7  Addressing bound
-# =====================================================================
-print("S7  Addressing")
-Nch = Vsolid / (100e-9)**3
-chk("optical regions (100 nm voxels)", Nch, 1.4e16, 0.02)
-chk("atoms per optical channel", atoms / Nch, 5e7, 0.01)
-E_ph = h * c / 1e-10                     # 1 Angstrom quantum
-chk("X-ray quantum [keV]", E_ph / q / 1e3, 12.4, 0.01)
-chk("X-ray / cohesive energy (~6 eV)", E_ph / q / 6, 2e3, 0.05)
-chk("X-ray deficit at design cell", E_ph / E_cell, 1.2e3, 0.04)
-chk("magnet stress at 100 T [GPa]", 100**2 / (2 * mu0) / 1e9, 4.0, 0.01)
-chk("magnetic channels/axis", 28.02e9 * 100 / 1e6, 3e6, 0.07)
-chk("in-flight per pillar", 0.1 * planes, 180, 0.01)
-chk("concurrent events at duty cap", 183 * pil_slab * 180, 1.5e15, 0.02)
+    @property
+    def silicon_equivalent_atoms(self) -> float:
+        return self.silicon_equivalent_moles * self.avogadro_mol_inv
 
-# =====================================================================
-# S7.5  Assembled bound (Figure 1 rungs; heat at internal-flux ceiling 2.8 MW)
-# =====================================================================
-print("S7.5 Assembled bound / Figure 1")
-Pmax = 2.8e6
-chk("naive mole rung [ev/s]", atoms * nu0, 5.8e36, 0.01)
-chk("Landauer-capped rung [ev/s]", Pmax / (kT * math.log(2)), 7e26, 0.05)
-chk("barrier rung [ev/s]", Pmax / (kT * Lam), 3e25, 0.08)
-inrange("charge-floor rung [ev/s]", Pmax / (0.5 * kT * Lam**2), 3e24, 4e24)
-chk("channel rung [ev/s]", Nch * f, 1.4e24, 0.02)
-chk("Landauer rung x", Pmax / (kT * math.log(2)) / HX, 3e7, 0.1)
-chk("barrier rung x", Pmax / (kT * Lam) / HX, 1.2e6, 0.03)
-chk("floor rung x", Pmax / (0.5 * kT * Lam**2) / HX, 1.4e5, 0.04)
-chk("channel rung x", Nch * f / HX, 6e4, 0.03)
-chk("design entry below assembled bound", (Nch * f) / B85, 26, 0.03)
-chk("face-feed vs internal flux (~4x)", 12e6 / Pmax, 4, 0.08)
-chk("Fig.1 cut: mole -> Landauer", atoms * nu0 / (Pmax / (kT * math.log(2))), 8e9, 0.02)
-chk("Fig.1 cut: Landauer -> barrier", Lam / math.log(2), 26, 0.02)
-chk("Fig.1 cut: barrier -> floor", Lam / 2, 9, 0.02)
-chk("Fig.1 margin: cap to channel rung", Nch * f / Bcap, 9, 0.05)
+    @property
+    def solid_cube_moles(self) -> float:
+        return self.cube_volume_m3 * self.silicon_density_kg_m3 / self.silicon_molar_mass_kg_mol
 
-# =====================================================================
-# S9.1  OP-T corner (836 K, 3 GHz, eps=1e-3, R=3, 21 cm3 monolith)
-# =====================================================================
-print("S9.1 OP-T corner")
-kT8  = k * 836
-Lam8 = math.log((kT8 / h) / (3e9 * 1e-3))
-E_opt = 0.5 * 4 * kT8 * Lam8**2
-chk("E_op(OP-T) [kT]", E_opt / kT8, 485, 0.01)
-chk("E_op(OP-T) [J]", E_opt, 5.6e-18, 0.01)
-N_opt = 21 * 0.3 / (15e-9 * 15e-9 * 30e-9 * 1e6)   # 30% fill, 15x15x30 nm cells
-chk("N(OP-T) switches", N_opt, 9.3e17, 0.01)
-P_opt = 2.32e6 * 412 * 0.7 * a * a * 25            # Ga single-pass [measured rho*cp]
-chk("P(OP-T) [MW]", P_opt / 1e6, 12.6, 0.01)
-chk("B(OP-T) [ev/s]", P_opt / E_opt, 2.3e24, 0.03)
-chk("alpha(OP-T)", P_opt / E_opt / (N_opt * 3e9), 8e-4, 0.02)
-chk("power density [kW/cm3]", P_opt / 1e3 / 21, 610, 0.02)
-chk("X-ray deficit at OP-T", E_ph / E_opt, 355, 0.01)
+    @property
+    def columns_per_face(self) -> float:
+        return (self.side_m / self.pitch_m) ** 2
 
-# =====================================================================
-# S9.5  Headroom ladder and delivery
-# =====================================================================
-print("S9.5 Headroom")
-chk("x B300 at conservative CHF", 300e4 * wall / E_cell / HX, 23000, 0.01)
-B_a1 = cells * 1.0 * f
-chk("B(alpha=1) [ev/s]", B_a1, 1.5e24, 0.02)
-chk("x B300 at alpha=1", B_a1 / HX, 66000, 0.01)
-chk("P(alpha=1) [MW]", B_a1 * E_cell / 1e6, 2.36, 0.03)
-chk("x B300 at optimistic CHF", 1000e4 * wall / E_cell / HX, 77000, 0.01)
-Lam_1G = math.log(nu0 / (1e9 * eps))
-chk("1 GHz energy falls x", (Lam / Lam_1G)**2, 1.3, 0.01)
-chk("busbar at 0.83 MW [MA]", 300e4 * wall / 0.9 / 1e6, 0.9, 0.03)
-chk("busbar at 2.4 MW [MA]", 2.4e6 / 0.9 / 1e6, 2.6, 0.03)
-chk("water at 0.83 MW [L/s]", 300e4 * wall / 2.2e6, 0.4, 0.06)
-chk("water at 2.77 MW [L/s]", 1000e4 * wall / 2.2e6, 1.3, 0.04)
+    @property
+    def leaf_shared_columns(self) -> float:
+        return self.leaves * self.columns_per_face
 
-# =====================================================================
-# S10  Reversible limit / clocking
-# =====================================================================
-print("S10 Clocking")
-Cagg = cells * 2 * Ccell                 # ~48 aF/cell incl. wiring (R=1)
-chk("aggregate C [F]", Cagg, 0.7, 0.02)
-order("L for 100 MHz resonance, whole body [H]",
-      1 / ((2 * math.pi * 1e8)**2 * Cagg), 1e-18)
-order("L per 1e-6 domain [H]",
-      1 / ((2 * math.pi * 1e8)**2 * Cagg * 1e-6), 1e-12)
-chk("body inductance mu0*a [nH]", mu0 * a * 1e9, 35, 0.02)
-chk("self-resonance [kHz]",
-    1 / (2 * math.pi * math.sqrt(mu0 * a * Cagg)) / 1e3, 1.0, 0.05)
-chk("wire Q at 15 nm, 3 GHz", 2 * math.pi * 3e9 * mu0 * (15e-9)**2 / 1e-7, 5e-5, 0.07)
+    @property
+    def face_distinct_columns(self) -> float:
+        return self.internal_faces * self.columns_per_face
 
-# =====================================================================
-# S11  Atomic/cryogenic limit
-# =====================================================================
-print("S11 Spins")
-gam = 1.760859e11                        # electron gyromagnetic ratio [rad/s/T]
-r = 20e-9
-nu_dd = mu0 * hbar * gam**2 / (4 * math.pi * r**3) / (2 * math.pi)
-chk("dipolar coupling at 20 nm [kHz]", nu_dd / 1e3, 6.5, 0.02)
-n_spin = 1 / (20e-7)**3                  # cm^-3 at 20 nm spacing
-chk("spin density below Mott (3.74e18)", n_spin / 3.74e18, 0.033, 0.02)
-spins = Vsolid * 1e6 / (20e-7)**3
-chk("spins in solid volume", spins, 1.7e18, 0.02)
-chk("copies per optical channel", spins / Nch, 125, 0.02)
+    def optical_sampling_count(self, wavelength_m: float, numerical_aperture: float) -> float:
+        if wavelength_m <= 0 or numerical_aperture <= 0:
+            raise ValueError("wavelength and numerical aperture must be positive")
+        return 2 * self.external_area_m2 / (wavelength_m / (2 * numerical_aperture)) ** 2
 
-# =====================================================================
-# S13  Sensitivity ranges (efficiency x, central 43)
-# =====================================================================
-print("S13 Sensitivity")
-eff = H_J / E_cell
-chk("alpha x2 (unfavorable): efficiency", eff / 2, 19, 0.03)
-chk("alpha /2 (favorable): efficiency", eff * 2, 78, 0.01)
-# correlation structure: both headline figures scale as 1/alpha; ratio locked
-chk("headline ratio locked at power ratio", 85e3 / B_P, 61, 0.01)
-chk("alpha x2 (unfavorable): throughput x", B85 / (2 * HX), 1200, 0.02)
-chk("eta_rec = 3 (S13.1 de-rate basis)", eff * 3 / 10, 12, 0.04)
-chk("eta_rec = 2 (basis low end)", eff * 2 / 10, 7.8, 0.01)
-chk("eta_rec = 5 (Tier-2 gate)", eff * 5 / 10, 19, 0.03)
-chk("eta_rec = 16 (step-count ceiling)", eff * 16 / 10, 62, 0.01)
-chk("n = 1.2", eff * n_ideal**2 / 1.2**2, 46, 0.015)
-chk("n = 1.5", eff * n_ideal**2 / 1.5**2, 29, 0.01)
-chk("C ratio 4 (ONO band low)", eff * (Ccell / Cmin) / 4, 50, 0.01)
-chk("C ratio 6 (ONO band high)", eff * (Ccell / Cmin) / 6, 33, 0.02)
-chk("exact low (alpha x2)", eff / (Lam_x / Lam)**2 / 2, 4.3, 0.02)
-chk("exact high (alpha /2)", eff / (Lam_x / Lam)**2 * 2, 17, 0.01)
+    def site_capacity_bytes(
+        self,
+        layers_per_face: int,
+        usable_fraction: float = 0.10,
+        net_bits_per_site: float = 1.0,
+    ) -> float:
+        if layers_per_face <= 0 or not 0 < usable_fraction <= 1 or net_bits_per_site <= 0:
+            raise ValueError("invalid site-capacity parameter")
+        return (
+            usable_fraction
+            * self.columns_per_face
+            * self.internal_faces
+            * layers_per_face
+            * net_bits_per_site
+            / 8
+        )
 
-# =====================================================================
-# S13.1  Compounded projections: the demonstrated-practice case
-# =====================================================================
-print("S13.1 Demonstrated-practice case")
-E_der = E_cell * 10 / 3                  # eta_rec 10 -> 3 (demonstrated)
-chk("E_op de-rated [eV]", E_der / q, 33.4, 0.01)
-B_der = 85e3 / E_der
-chk("B de-rated at 85 kW [ev/s]", B_der, 1.6e22, 0.01)
-chk("x B300, three projections de-rated", B_der / HX, 710, 0.01)
-chk("efficiency de-rated", H_J / E_der, 12, 0.04)
-cells_prod = cells * 300 / 1800          # planes 1800 -> 300 (production, 2-3 decks)
-chk("cells at 300 planes", cells_prod, 2.5e15, 0.02)
-chk("duty cap at 300 planes [ev/s] (does not bind)", cells_prod * 0.1 * f, 2.5e22, 0.02)
-assert cells_prod * 0.1 * f > B_der, "duty cap must not bind in the 1,600x row"
-chk("weights at 300 planes [PB]", cells_prod / 8 / 1e15, 0.3, 0.03)
-cells_cmos = cells_prod / 10             # IGZO -> bonded-CMOS retreat (10x density)
-Bcap_cmos = cells_cmos * 0.1 * f
-chk("duty cap, bonded-CMOS retreat [ev/s] (binds)", Bcap_cmos, 2.5e21, 0.02)
-chk("x B300, all four de-rated", Bcap_cmos / HX, 110, 0.01)
-chk("power, all four de-rated [kW]", Bcap_cmos * E_der / 1e3, 13, 0.02)
-chk("weights, retreat [TB]", cells_cmos / 8 / 1e12, 31, 0.01)
-chk("x B300 HBM, retreat", cells_cmos / 8 / 288e9, 110, 0.04)
-chk("fully de-rated floor at 10^2.0", math.log10(Bcap_cmos / HX), 2.0, 0.02)
-chk("three-de-rated at 10^2.8", math.log10(B_der / HX), 2.8, 0.02)
-chk("projections buy ~20x vs de-rated corner", B85 / HX / (Bcap_cmos / HX), 20, 0.08)
-chk("recovery alone buys x3.3 at fixed power", (B85 / HX) / (B_der / HX), 3.3, 0.02)
-chk("composite best-demonstrated (430 planes) floor", cells * 430 / 1800 / 10 * 0.1 * f / HX, 160, 0.03)
-# graded floor: process-grounded 600-plane proposal (4-5 demonstrated deck
-# cycles, ~30 um stack; MSA-CBA bonding route reaches the same count [40])
-cells_600 = cells * 600 / 1800
-chk("proposal floor: duty cap at 600-plane retreat [ev/s]", cells_600 / 10 * 0.1 * f, 4.9e21, 0.02)
-chk("proposal floor: x B300", cells_600 / 10 * 0.1 * f / HX, 220, 0.01)
-chk("proposal floor: power [kW]", cells_600 / 10 * 0.1 * f * E_der / 1e3, 26, 0.02)
-chk("proposal floor: weights [TB]", cells_600 / 10 / 8 / 1e12, 61, 0.01)
-chk("600 planes = 4-5 demonstrated decks", 600 / 143, 4.2, 0.02)
-chk("stack height at 600 planes [um]", 600 * 50e-9 * 1e6, 30, 0.01)
-chk("vs tallest shipping stack (~2x)", 600 * 50 / (321 * 45), 2.1, 0.03)
-import math as _m
-chk("proposal floor at 10^2.3", _m.log10(cells_600 / 10 * 0.1 * f / HX), 2.3, 0.02)
 
-# =====================================================================
-# S13.3  Proof-of-concept tiers (mini-cube numbers)
-# =====================================================================
-print("S13.3 PoC tiers")
-mini = 16 * (1e-2 / 130e-9)**2 * 180
-chk("mini-cube cells", mini, 1.7e13, 0.01)
-chk("mini-cube spec [ev/s]", mini * 0.1 * f, 1.7e20, 0.01)
-chk("mini-cube spec x B300", mini * 0.1 * f / HX, 7.6, 0.01)
-chk("mini-cube spec power [W]", mini * 0.1 * f * E_cell, 270, 0.02)
-chk("Tier-3 pass threshold x B300", 2e19 / HX, 0.9, 0.02)
-chk("Tier-2 worst-case pass [eV]", (30e-18 / Cmin) * 1.45**2 * kT * Lam**2 / 10 / q, 15.6, 0.02)
+@dataclass(frozen=True)
+class ThermionicReference:
+    temperature_k: float = 400.0
+    frequency_hz: float = 100e6
+    s: float = 10.0
+    ideality: float = 1.0
+    wiring_ratio: float = 1.0
+    capacitance_ratio: float = 1.0
+    recovery_factor: float = 1.0
+    boltzmann_j_k: float = 1.380649e-23
+    planck_j_s: float = 6.62607015e-34
+    electron_charge_c: float = 1.602176634e-19
 
-# =====================================================================
-print()
-print("NOT RECOMPUTED (inputs not fully pinned in the paper; tagged there):")
-for note in [
-    "S6  face-feed ~12 MW and pumping-power <1% (need channel geometry)",
-    "S7  word-plane RC: ~ps segment vs ~9 us slab-global (needs sheet R, C')",
-    "S9.4 volumetric-density ~1e6x and communication-radius 1e3-1e4x (order-of-magnitude)",
-    "S10 loaded-line velocity ~1e2 m/s (needs per-length L', C')",
-    "S11 net ~450x spin advantage (chain includes cryo wall-plug range)",
-    "S12 GAA natural length ~12 nm and n ~ 1.3 (TCAD-level, PoC Tier 1 measures)",
-]:
-    print("  -", note)
+    @property
+    def attempt_frequency_hz(self) -> float:
+        return self.boltzmann_j_k * self.temperature_k / self.planck_j_s
 
-print()
-try:
-    sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
-                         capture_output=True, text=True, timeout=5).stdout.strip()
-except Exception:
-    sha = ""
-print(f"checks: {NCHK[0]}, failures: {len(FAIL)}" + (f"  (git {sha})" if sha else ""))
-print("RESULT:", "ALL CHECKS PASS" if not FAIL else f"FAILURES: {FAIL}")
-sys.exit(0 if not FAIL else 1)
+    def log_factor_for(self, epsilon: float) -> float:
+        if not 0 < epsilon < 1:
+            raise ValueError("epsilon must lie in (0,1)")
+        return math.log(
+            self.attempt_frequency_hz
+            / (self.frequency_hz * (-math.log1p(-epsilon)))
+        )
+
+    def approximate_log_factor_for(self, epsilon: float) -> float:
+        if not 0 < epsilon < 1:
+            raise ValueError("epsilon must lie in (0,1)")
+        return math.log(self.attempt_frequency_hz / (self.frequency_hz * epsilon))
+
+    @property
+    def cq_f(self) -> float:
+        return self.electron_charge_c**2 / (self.boltzmann_j_k * self.temperature_k)
+
+    def barrier_j_for(self, epsilon: float) -> float:
+        return self.boltzmann_j_k * self.temperature_k * self.log_factor_for(epsilon)
+
+    def gate_swing_v_for(self, epsilon: float, ideality: float | None = None) -> float:
+        n = self.ideality if ideality is None else ideality
+        return n * self.boltzmann_j_k * self.temperature_k / self.electron_charge_c * self.log_factor_for(epsilon)
+
+    def no_offset_j_for(
+        self,
+        epsilon: float,
+        *,
+        ideality: float | None = None,
+        wiring_ratio: float | None = None,
+        capacitance_ratio: float | None = None,
+        recovery_factor: float | None = None,
+    ) -> float:
+        n = self.ideality if ideality is None else ideality
+        r = self.wiring_ratio if wiring_ratio is None else wiring_ratio
+        chi = self.capacitance_ratio if capacitance_ratio is None else capacitance_ratio
+        eta = self.recovery_factor if recovery_factor is None else recovery_factor
+        if n <= 0 or r < 0 or chi <= 0 or eta <= 0:
+            raise ValueError("invalid thermionic parameter")
+        return (
+            0.5
+            * (1 + r)
+            * n**2
+            * self.boltzmann_j_k
+            * self.temperature_k
+            * self.log_factor_for(epsilon) ** 2
+            * chi
+            / eta
+        )
+
+    def no_offset_j_direct_for(
+        self,
+        epsilon: float,
+        *,
+        ideality: float | None = None,
+        wiring_ratio: float | None = None,
+        capacitance_ratio: float | None = None,
+        recovery_factor: float | None = None,
+    ) -> float:
+        n = self.ideality if ideality is None else ideality
+        r = self.wiring_ratio if wiring_ratio is None else wiring_ratio
+        chi = self.capacitance_ratio if capacitance_ratio is None else capacitance_ratio
+        eta = self.recovery_factor if recovery_factor is None else recovery_factor
+        c_cell = chi * self.cq_f
+        voltage = self.gate_swing_v_for(epsilon, n)
+        return 0.5 * (1 + r) * c_cell * voltage**2 / eta
+
+    def static_threshold_j_for(self, epsilon: float) -> float:
+        return (
+            0.5
+            * (1 + self.wiring_ratio)
+            * self.ideality**2
+            * self.boltzmann_j_k
+            * self.temperature_k
+            * math.log(self.s / epsilon) ** 2
+            * self.capacitance_ratio
+            / self.recovery_factor
+        )
+
+    def ev(self, joules: float) -> float:
+        return joules / self.electron_charge_c
+
+    def poisson_failure_for_barrier(self, barrier_j: float) -> float:
+        gamma = self.attempt_frequency_hz * math.exp(-barrier_j / (self.boltzmann_j_k * self.temperature_k))
+        return -math.expm1(-gamma / self.frequency_hz)
+
+
+@dataclass(frozen=True)
+class DensityEnvelope:
+    side_mm: float = 27.5
+    faces: int = 338
+    density_gbit_mm2: float = 28.5
+    retention: float = 0.90
+    anchor_layers: float = 280.0
+
+    @property
+    def area_mm2(self) -> float:
+        return self.faces * self.side_mm**2
+
+    def gross_bytes(self, density_gbit_mm2: float) -> float:
+        return self.area_mm2 * density_gbit_mm2 * 1e9 / 8
+
+    def net_bytes(self, density_gbit_mm2: float) -> float:
+        return self.retention * self.gross_bytes(density_gbit_mm2)
+
+    def linear_density(self, layers: float) -> float:
+        return self.density_gbit_mm2 * layers / self.anchor_layers
+
+    def density_for_net_bytes(self, net_bytes: float) -> float:
+        return net_bytes * 8 / (self.retention * self.area_mm2 * 1e9)
+
+
+@dataclass(frozen=True)
+class Operator:
+    width: int = 8192
+    block: int = 128
+    rank: int = 128
+    top_k: int = 2
+    experts: int = 128
+
+    @property
+    def dense_macs(self) -> int:
+        return self.width**2
+
+    @property
+    def structured_base_macs(self) -> int:
+        return 2 * self.width * self.block
+
+    @property
+    def active_expert_macs(self) -> int:
+        return 2 * self.top_k * self.width * self.rank
+
+    @property
+    def active_macs(self) -> int:
+        return self.structured_base_macs + self.active_expert_macs
+
+    @property
+    def work_ratio(self) -> float:
+        return self.dense_macs / self.active_macs
+
+    @property
+    def base_parameters(self) -> int:
+        return 2 * self.width * self.block
+
+    @property
+    def expert_parameters(self) -> int:
+        return self.experts * 2 * self.width * self.rank
+
+    @property
+    def parameters_per_layer(self) -> int:
+        return self.base_parameters + self.expert_parameters
+
+
+@dataclass(frozen=True)
+class B300Reference:
+    dense_fp8_flops_s: float = 5e15
+    dense_nvfp4_flops_s: float = 15e15
+    hbm_bytes: float = 288e9
+    hbm_bandwidth_b_s: float = 8e12
+    maximum_tgp_w: float = 1400.0
+
+    @property
+    def dense_fp8_macs_s(self) -> float:
+        return self.dense_fp8_flops_s / 2
+
+    @property
+    def dense_nvfp4_macs_s(self) -> float:
+        return self.dense_nvfp4_flops_s / 2
+
+
+class Verifier:
+    def __init__(self) -> None:
+        self.checks = 0
+        self.failures: list[str] = []
+
+    def _record(self, name: str, ok: bool, detail: str = "") -> None:
+        self.checks += 1
+        print(f"{'PASS' if ok else 'FAIL'}  {name}{(': ' + detail) if detail else ''}")
+        if not ok:
+            self.failures.append(name)
+
+    def close(
+        self,
+        name: str,
+        got: float,
+        expected: float,
+        *,
+        rel_tol: float = 1e-11,
+        abs_tol: float = 0.0,
+    ) -> None:
+        ok = math.isfinite(got) and math.isfinite(expected) and math.isclose(
+            got, expected, rel_tol=rel_tol, abs_tol=abs_tol
+        )
+        self._record(name, ok, f"got {got:.15g}; expected {expected:.15g}")
+
+    def equal(self, name: str, got: Any, expected: Any) -> None:
+        self._record(name, got == expected, f"got {got!r}; expected {expected!r}")
+
+    def true(self, name: str, condition: bool, detail: str = "") -> None:
+        self._record(name, bool(condition), detail)
+
+    def contains(self, name: str, text: str, snippet: str) -> None:
+        self._record(name, snippet in text, f"required snippet {snippet!r}")
+
+    def absent(self, name: str, text: str, snippet: str) -> None:
+        self._record(name, snippet not in text, f"forbidden snippet {snippet!r}")
+
+
+def effective_work_arms(
+    available_incremental_power_w: float,
+    effective_energy_j: float,
+    streams: float,
+    stream_rate_hz: float,
+    effective_units_per_update: float,
+    output_bandwidth_b_s: float,
+    output_bytes_per_unit: float,
+    sites: float,
+    site_rate_hz: float,
+    site_cycles_per_unit: float,
+) -> tuple[float, float, float, float]:
+    inputs = (
+        available_incremental_power_w,
+        effective_energy_j,
+        streams,
+        stream_rate_hz,
+        effective_units_per_update,
+        output_bandwidth_b_s,
+        output_bytes_per_unit,
+        sites,
+        site_rate_hz,
+        site_cycles_per_unit,
+    )
+    if min(inputs) <= 0:
+        raise ValueError("all effective-work inputs must be positive")
+    return (
+        available_incremental_power_w / effective_energy_j,
+        streams * stream_rate_hz * effective_units_per_update,
+        output_bandwidth_b_s / output_bytes_per_unit,
+        sites * site_rate_hz / site_cycles_per_unit,
+    )
+
+
+def effective_work_bound(*args: float) -> float:
+    return min(effective_work_arms(*args))
+
+
+def fixed_half_up(value: float, decimals: int) -> str:
+    """Format a computed float with conventional decimal half-up rounding."""
+    stabilized = round(value, decimals + 8)
+    quantum = Decimal(1).scaleb(-decimals)
+    return format(Decimal(str(stabilized)).quantize(quantum, rounding=ROUND_HALF_UP), "f")
+
+
+def sci_tex(value: float, decimals: int) -> str:
+    if value == 0:
+        return "0"
+    exponent = math.floor(math.log10(abs(value)))
+    mantissa = value / 10**exponent
+    return rf"{mantissa:.{decimals}f}\times10^{{{exponent}}}"
+
+
+def build_results() -> dict[str, Any]:
+    cube = Cube()
+    therm = ThermionicReference()
+    density = DensityEnvelope()
+    op = Operator()
+    b300 = B300Reference()
+
+    raw_eps = 1e-3
+    unit_delta = 1e-3
+    union_eps = unit_delta / op.active_macs
+    exact_eps = -math.expm1(math.log1p(-unit_delta) / op.active_macs)
+    union_raw_j = therm.no_offset_j_for(union_eps)
+    illustrative_transition_contribution_j = op.active_macs * union_raw_j
+
+    sensitivity_eps = [1e-3, 1e-6, 1e-9, union_eps, 1e-12, 1e-15]
+    sensitivity = {
+        f"{eps:.17g}": {
+            "epsilon": eps,
+            "lambda": therm.log_factor_for(eps),
+            "energy_eV": therm.ev(therm.no_offset_j_for(eps)),
+            "rate_at_1p4kW_s_inv": 1400.0 / therm.no_offset_j_for(eps),
+        }
+        for eps in sensitivity_eps
+    }
+
+    optical_nas = [0.5, 1.0, 2.65]
+    wavelength = 532e-9
+    optical = {str(na): cube.optical_sampling_count(wavelength, na) for na in optical_nas}
+
+    event_powers = [1400.0, 10_000.0, 100_000.0]
+    baseline_raw_j = therm.no_offset_j_for(raw_eps)
+    raw_power_rows = []
+    for power in event_powers:
+        rate = power / baseline_raw_j
+        raw_power_rows.append(
+            {
+                "power_w": power,
+                "flux_w_cm2": power / (cube.external_area_m2 * 1e4),
+                "raw_transitions_s_inv": rate,
+                "raw_yield_optical_na1": rate / (optical["1.0"] * therm.frequency_hz),
+                "raw_yield_leaf_columns": rate / (cube.leaf_shared_columns * therm.frequency_hz),
+            }
+        )
+
+    density300 = density.linear_density(300)
+    density600 = density.linear_density(600)
+    net_pb_threshold_density = density.density_for_net_bytes(1e15)
+    threshold_gross_bytes = density.gross_bytes(net_pb_threshold_density)
+
+    intensity_1b = op.active_macs / op.width
+    intensity_2b = op.active_macs / (2 * op.width)
+    target_macs = 25e15
+
+    result: dict[str, Any] = {
+        "metadata": {"package_version": PACKAGE_VERSION, "paper_title": PAPER_TITLE},
+        "inputs": {
+            "cube": asdict(cube),
+            "thermionic": asdict(therm),
+            "density": asdict(density),
+            "operator": asdict(op),
+            "b300": asdict(b300),
+        },
+        "geometry": {
+            "cube_volume_cm3": cube.cube_volume_m3 * 1e6,
+            "active_solid_volume_cm3": cube.active_solid_volume_m3 * 1e6,
+            "stack_thickness_mm": cube.stack_thickness_m * 1e3,
+            "remaining_margin_mm": cube.remaining_margin_m * 1e3,
+            "external_area_cm2": cube.external_area_m2 * 1e4,
+            "active_face_area_mm2": cube.active_face_area_mm2,
+            "silicon_equivalent_mass_g": cube.silicon_equivalent_mass_kg * 1e3,
+            "silicon_equivalent_moles": cube.silicon_equivalent_moles,
+            "silicon_equivalent_atoms": cube.silicon_equivalent_atoms,
+            "solid_cube_moles": cube.solid_cube_moles,
+        },
+        "thermionic": {
+            "attempt_frequency_hz": therm.attempt_frequency_hz,
+            "lambda_raw_1e_3": therm.log_factor_for(raw_eps),
+            "lambda_approx_raw_1e_3": therm.approximate_log_factor_for(raw_eps),
+            "approx_energy_relative_difference": (
+                therm.no_offset_j_for(raw_eps)
+                - therm.boltzmann_j_k * therm.temperature_k * therm.approximate_log_factor_for(raw_eps) ** 2
+            )
+            / therm.no_offset_j_for(raw_eps),
+            "cq_aF": therm.cq_f * 1e18,
+            "barrier_raw_1e_3_eV": therm.ev(therm.barrier_j_for(raw_eps)),
+            "static_raw_1e_3_eV": therm.ev(therm.static_threshold_j_for(raw_eps)),
+            "no_offset_raw_1e_3_eV": therm.ev(baseline_raw_j),
+            "no_offset_static_ratio": baseline_raw_j / therm.static_threshold_j_for(raw_eps),
+            "sensitivity": sensitivity,
+        },
+        "reliability": {
+            "unit_transitions": op.active_macs,
+            "unit_error_target": unit_delta,
+            "union_raw_epsilon": union_eps,
+            "exact_independent_raw_epsilon": exact_eps,
+            "exact_union_relative_difference": exact_eps / union_eps - 1,
+            "union_raw_energy_eV": therm.ev(union_raw_j),
+            "exact_raw_energy_eV": therm.ev(therm.no_offset_j_for(exact_eps)),
+            "illustrative_transition_contribution_j": illustrative_transition_contribution_j,
+            "illustrative_transition_contribution_pj": illustrative_transition_contribution_j * 1e12,
+            "illustrative_rate_quotient_at_1p4kw_s_inv": 1400.0 / illustrative_transition_contribution_j,
+            "replay_factor_union_epsilon": 1.0 / (1.0 - union_eps),
+        },
+        "channels": {
+            "wavelength_nm": wavelength * 1e9,
+            "optical_sampling_counts": optical,
+            "columns_per_face": cube.columns_per_face,
+            "leaf_shared_columns": cube.leaf_shared_columns,
+            "face_distinct_columns": cube.face_distinct_columns,
+        },
+        "raw_resources": {
+            "constituent_cycles_at_100MHz_s_inv": cube.silicon_equivalent_atoms * therm.frequency_hz,
+            "power_rows": raw_power_rows,
+            "serial_inactive_300": 1 - 1 / 300,
+            "serial_inactive_600": 1 - 1 / 600,
+        },
+        "illustrative_normalization": {
+            "energy_arm_s_inv": 1400.0 / illustrative_transition_contribution_j,
+            "site_cycle_arm_s_inv": cube.silicon_equivalent_atoms * therm.frequency_hz / op.active_macs,
+            "output_arm_per_TBps_1byte_s_inv": 1e12 / op.width,
+            "output_arm_per_TBps_2byte_s_inv": 1e12 / (2 * op.width),
+        },
+        "capacity": {
+            "site_300_TB": cube.site_capacity_bytes(300) / 1e12,
+            "site_600_TB": cube.site_capacity_bytes(600) / 1e12,
+            "site_300_to_b300_hbm": cube.site_capacity_bytes(300) / b300.hbm_bytes,
+            "site_600_to_b300_hbm": cube.site_capacity_bytes(600) / b300.hbm_bytes,
+            "published_gross_PB": density.gross_bytes(28.5) / 1e15,
+            "published_net_PB": density.net_bytes(28.5) / 1e15,
+            "linear_density_300_Gb_mm2": density300,
+            "linear_density_600_Gb_mm2": density600,
+            "linear_net_300_PB": density.net_bytes(density300) / 1e15,
+            "linear_net_600_PB": density.net_bytes(density600) / 1e15,
+            "net_petabyte_threshold_density_Gb_mm2": net_pb_threshold_density,
+            "net_petabyte_threshold_gross_PB": threshold_gross_bytes / 1e15,
+            "net_petabyte_threshold_net_PB": density.net_bytes(net_pb_threshold_density) / 1e15,
+        },
+        "operator": {
+            "dense_macs": op.dense_macs,
+            "structured_base_macs": op.structured_base_macs,
+            "active_expert_macs": op.active_expert_macs,
+            "active_macs": op.active_macs,
+            "work_ratio": op.work_ratio,
+            "base_parameters": op.base_parameters,
+            "expert_parameters": op.expert_parameters,
+            "parameters_per_layer": op.parameters_per_layer,
+            "parameters_100_layers_GB_1byte": op.parameters_per_layer * 100 / 1e9,
+            "output_intensity_1byte_MAC_B": intensity_1b,
+            "output_intensity_2byte_MAC_B": intensity_2b,
+            "required_resident_reuse_at_8TBps_MAC_B": target_macs / b300.hbm_bandwidth_b_s,
+            "minimum_output_bandwidth_1byte_TBps": target_macs / intensity_1b / 1e12,
+            "minimum_output_bandwidth_2byte_TBps": target_macs / intensity_2b / 1e12,
+        },
+        "b300": {
+            "dense_fp8_macs_s": b300.dense_fp8_macs_s,
+            "dense_nvfp4_macs_s": b300.dense_nvfp4_macs_s,
+            "fp8_spec_quotient_fJ_MAC": b300.maximum_tgp_w / b300.dense_fp8_macs_s * 1e15,
+            "nvfp4_spec_quotient_fJ_MAC": b300.maximum_tgp_w / b300.dense_nvfp4_macs_s * 1e15,
+            "tenfold_target_PetaMAC_s": 10 * b300.dense_fp8_macs_s / 1e15,
+            "tenfold_energy_ceiling_fJ_MAC": b300.maximum_tgp_w / (10 * b300.dense_fp8_macs_s) * 1e15,
+        },
+    }
+    return result
+
+
+def verify_formulae(v: Verifier, r: dict[str, Any]) -> None:
+    cube = Cube()
+    therm = ThermionicReference()
+    density = DensityEnvelope()
+    op = Operator()
+
+    print("\nINDEPENDENT FORMULA IDENTITIES")
+    v.close("cube volume by millimetre conversion", r["geometry"]["cube_volume_cm3"], (27.5**3) / 1000)
+    v.close("active volume by leaf sum", r["geometry"]["active_solid_volume_cm3"], 170 * 27.5**2 * 0.1 / 1000)
+    v.close("stack plus margin equals side", r["geometry"]["stack_thickness_mm"] + r["geometry"]["remaining_margin_mm"], 27.5)
+    v.close("moles recover from atoms", r["geometry"]["silicon_equivalent_atoms"] / cube.avogadro_mol_inv, r["geometry"]["silicon_equivalent_moles"])
+    v.close("mass recover from moles", r["geometry"]["silicon_equivalent_moles"] * cube.silicon_molar_mass_kg_mol * 1e3, r["geometry"]["silicon_equivalent_mass_g"])
+    v.close("active face area matches cube geometry", r["geometry"]["active_face_area_mm2"], cube.internal_faces * (cube.side_m * 1e3) ** 2)
+
+    for eps_key, row in r["thermionic"]["sensitivity"].items():
+        eps = row["epsilon"]
+        compact = therm.no_offset_j_for(eps)
+        direct = therm.no_offset_j_direct_for(eps)
+        v.close(f"thermionic compact/direct energy identity epsilon={eps_key}", compact, direct, rel_tol=2e-14)
+        v.close(f"barrier reproduces Poisson error epsilon={eps_key}", therm.poisson_failure_for_barrier(therm.barrier_j_for(eps)), eps, rel_tol=2e-7, abs_tol=1e-18)
+        v.close(f"energy-rate inverse identity epsilon={eps_key}", row["rate_at_1p4kW_s_inv"] * compact, 1400.0, rel_tol=2e-14)
+
+    raw_eps = 1e-3
+    swing = therm.gate_swing_v_for(raw_eps)
+    v.close("thermionic swing creates barrier", therm.electron_charge_c * swing / therm.ideality, therm.barrier_j_for(raw_eps), rel_tol=2e-14)
+    static_v = therm.ideality * therm.boltzmann_j_k * therm.temperature_k / therm.electron_charge_c * math.log(therm.s / raw_eps)
+    v.close("static threshold current ratio", math.exp(therm.electron_charge_c * static_v / (therm.ideality * therm.boltzmann_j_k * therm.temperature_k)), therm.s / raw_eps, rel_tol=2e-14)
+
+    union_eps = r["reliability"]["union_raw_epsilon"]
+    exact_eps = r["reliability"]["exact_independent_raw_epsilon"]
+    m = r["reliability"]["unit_transitions"]
+    delta = r["reliability"]["unit_error_target"]
+    v.true("union bound is sufficient", m * union_eps <= delta * (1 + 1e-15))
+    v.close("exact independent composition returns unit target", -math.expm1(m * math.log1p(-exact_eps)), delta, rel_tol=2e-12)
+    v.true("union bound is stricter than exact independent requirement", union_eps < exact_eps)
+    v.close("illustrative transition contribution is transition count times union energy", r["reliability"]["illustrative_transition_contribution_j"], m * therm.no_offset_j_for(union_eps), rel_tol=2e-14)
+
+    for na_text, count in r["channels"]["optical_sampling_counts"].items():
+        na = float(na_text)
+        alternate = 8 * cube.external_area_m2 * na**2 / (532e-9) ** 2
+        v.close(f"optical count two-form identity NA={na_text}", count, alternate, rel_tol=2e-14)
+    v.close("column count from mm/nm units", r["channels"]["columns_per_face"], (27.5e6 / 130) ** 2)
+
+    v.close("site capacity direct area-pitch identity 300", r["capacity"]["site_300_TB"] * 1e12, 0.10 * (cube.side_m / cube.pitch_m) ** 2 * cube.internal_faces * 300 / 8)
+    v.close("density area agrees with cube", density.area_mm2, cube.active_face_area_mm2)
+    v.close("net-petabyte threshold closes to one PB", r["capacity"]["net_petabyte_threshold_net_PB"], 1.0, rel_tol=2e-14)
+
+    v.equal("active MAC decomposition", op.active_macs, op.structured_base_macs + op.active_expert_macs)
+    v.equal("parameter decomposition", op.parameters_per_layer, op.base_parameters + op.expert_parameters)
+    v.close("work ratio identity", r["operator"]["work_ratio"] * op.active_macs, op.dense_macs, rel_tol=2e-14)
+    v.close("one-byte intensity identity", r["operator"]["output_intensity_1byte_MAC_B"] * op.width, op.active_macs)
+    v.close("two-byte bandwidth doubles", r["operator"]["minimum_output_bandwidth_2byte_TBps"], 2 * r["operator"]["minimum_output_bandwidth_1byte_TBps"])
+
+
+def verify_bounds(v: Verifier) -> None:
+    print("\nBOUND AND SCALING PROPERTY TESTS")
+    rng = random.Random(20260721)
+    for i in range(100):
+        args = [10 ** rng.uniform(-3, 6) for _ in range(10)]
+        arms = effective_work_arms(*args)
+        bound = effective_work_bound(*args)
+        if not math.isclose(bound, min(arms), rel_tol=0.0, abs_tol=0.0):
+            v.true("effective-work bound returns minimum arm", False, f"case {i}")
+            break
+    else:
+        v.true("effective-work bound returns minimum arm for 100 deterministic cases", True)
+
+    base = [1400.0, 1e-9, 1e9, 1e8, 2.0, 8e12, 16384.0, 1e12, 1e8, 1e3]
+    b0 = effective_work_bound(*base)
+    for resource_index in (0, 2, 3, 4, 5, 7, 8):
+        changed = list(base)
+        changed[resource_index] *= 2
+        v.true(f"bound monotone in resource input {resource_index}", effective_work_bound(*changed) >= b0)
+    for cost_index in (1, 6, 9):
+        changed = list(base)
+        changed[cost_index] *= 2
+        v.true(f"bound antitone in cost input {cost_index}", effective_work_bound(*changed) <= b0)
+
+    def scaling_bound(L: float) -> float:
+        return effective_work_bound(
+            3 * L**2,
+            2.0,
+            5 * L**2,
+            7.0,
+            11.0,
+            13 * L**2,
+            17.0,
+            19 * L**3,
+            23.0,
+            29.0,
+        )
+
+    v.close("surface scaling numerical sanity R(2L)/R(L)", scaling_bound(2.0) / scaling_bound(1.0), 4.0)
+    v.close("resident-normalized scaling sanity", (scaling_bound(2.0) / (2.0**3)) / (scaling_bound(1.0) / 1.0**3), 0.5)
+
+    c_t = 3.0
+    c_m = 7.0
+    tau = 2.0
+    dark_10 = max(0.0, 1 - tau * c_t / (c_m * 10))
+    dark_100 = max(0.0, 1 - tau * c_t / (c_m * 100))
+    v.true("dark-state lower bound increases with size", dark_100 > dark_10)
+    v.true("dark-state lower bound lies in [0,1]", 0 <= dark_10 <= 1 and 0 <= dark_100 <= 1)
+
+    # Correct schedule-average output relation. It is intentionally not a pointwise bound on gamma_u.
+    actual_updates = 4e6
+    interval_s = 2.0
+    output_bandwidth = 8e12
+    bytes_per_unit = 16384.0
+    effective_units = output_bandwidth * interval_s / bytes_per_unit
+    average_yield = effective_units / actual_updates
+    v.close(
+        "schedule-average yield relation at saturated output",
+        average_yield,
+        output_bandwidth * interval_s / (actual_updates * bytes_per_unit),
+        rel_tol=2e-14,
+    )
+
+
+def manuscript_snippets(r: dict[str, Any]) -> list[tuple[str, str]]:
+    g = r["geometry"]
+    t = r["thermionic"]
+    rel = r["reliability"]
+    ch = r["channels"]
+    rr = r["raw_resources"]
+    al = r["illustrative_normalization"]
+    cap = r["capacity"]
+    op = r["operator"]
+    b = r["b300"]
+    bi = r["inputs"]["b300"]
+
+    rows = rr["power_rows"]
+    sens = list(t["sensitivity"].values())
+    return [
+        ("cube volume", f"{g['cube_volume_cm3']:.4f}~\\mathrm{{cm^3}}"),
+        ("active volume", f"{g['active_solid_volume_cm3']:.4f}~\\mathrm{{cm^3}}"),
+        ("stack thickness", f"{g['stack_thickness_mm']:.2f}~mm"),
+        ("remaining margin", f"{g['remaining_margin_mm']:.2f}~mm"),
+        ("external area", f"{g['external_area_cm2']:.3f}~\\mathrm{{cm^2}}"),
+        ("silicon-equivalent mass", f"{g['silicon_equivalent_mass_g']:.3f}~\\mathrm{{g}}"),
+        ("silicon-equivalent moles", f"{g['silicon_equivalent_moles']:.4f}~\\mathrm{{mol}}"),
+        ("silicon-equivalent atoms", f"{sci_tex(g['silicon_equivalent_atoms'], 3)}\\ \\text{{atoms}}"),
+        ("solid cube moles", f"{g['solid_cube_moles']:.3f}~mol"),
+        ("attempt frequency", f"{sci_tex(t['attempt_frequency_hz'], 3)}~\\mathrm{{s^{{-1}}}}"),
+        ("baseline lambda", f"\\Lambda_\\varepsilon&={t['lambda_raw_1e_3']:.4f}"),
+        ("Cq", f"{t['cq_aF']:.3f}~\\mathrm{{aF}}"),
+        ("barrier", f"{t['barrier_raw_1e_3_eV']:.5f}~\\mathrm{{eV}}"),
+        ("static energy", f"{t['static_raw_1e_3_eV']:.3f}~\\mathrm{{eV}}"),
+        ("raw energy", f"{t['no_offset_raw_1e_3_eV']:.4f}~\\mathrm{{eV}}"),
+        ("small-error approximation fraction", f"{abs(t['approx_energy_relative_difference'])*1e5:.1f}\\times10^{{-5}}"),
+        ("union epsilon", f"{rel['union_raw_epsilon']*1e10:.6f}\\times10^{{-10}}"),
+        ("exact epsilon", f"{rel['exact_independent_raw_epsilon']*1e10:.6f}\\times10^{{-10}}"),
+        ("union transition energy", fixed_half_up(rel['union_raw_energy_eV'], 4)),
+        ("illustrative rate quotient", f"{sci_tex(rel['illustrative_rate_quotient_at_1p4kw_s_inv'], 3)}"),
+        ("chi 10 transition rate", sci_tex(rel['illustrative_rate_quotient_at_1p4kw_s_inv'] / 10, 3)),
+        ("chi 100 transition rate", sci_tex(rel['illustrative_rate_quotient_at_1p4kw_s_inv'] / 100, 3)),
+        ("optical NA 0.5", f"{sci_tex(ch['optical_sampling_counts']['0.5'], 2)}"),
+        ("optical NA 1", f"{sci_tex(ch['optical_sampling_counts']['1.0'], 2)}"),
+        ("optical NA 2.65", f"{sci_tex(ch['optical_sampling_counts']['2.65'], 2)}"),
+        ("columns per face", f"{sci_tex(ch['columns_per_face'], 3)}"),
+        ("leaf columns", f"{sci_tex(ch['leaf_shared_columns'], 3)}"),
+        ("face columns", f"{sci_tex(ch['face_distinct_columns'], 4)}"),
+        ("constituent cycles", f"{sci_tex(rr['constituent_cycles_at_100MHz_s_inv'], 2)}"),
+        ("serial 300 inactive", f"{100*rr['serial_inactive_300']:.3f}\\%"),
+        ("serial 600 inactive", f"{100*rr['serial_inactive_600']:.3f}\\%"),
+        ("raw power 1.4kW rate", f"{sci_tex(rows[0]['raw_transitions_s_inv'], 2)}"),
+        ("raw power 10kW rate", f"{sci_tex(rows[1]['raw_transitions_s_inv'], 2)}"),
+        ("raw power 100kW rate", f"{sci_tex(rows[2]['raw_transitions_s_inv'], 2)}"),
+        ("raw flux 1.4kW", f"{rows[0]['flux_w_cm2']:.1f}"),
+        ("raw flux 10kW", f"{rows[1]['flux_w_cm2']:.0f}"),
+        ("raw flux 100kW", f"{rows[2]['flux_w_cm2']:.0f}"),
+        ("effective output 1byte", sci_tex(al['output_arm_per_TBps_1byte_s_inv'], 3)),
+        ("effective output 2byte", sci_tex(al['output_arm_per_TBps_2byte_s_inv'], 3)),
+        ("site capacity 300", f"{fixed_half_up(cap['site_300_TB'], 4)}~\\mathrm{{TB}}"),
+        ("site capacity 600", f"{fixed_half_up(cap['site_600_TB'], 4)}~\\mathrm{{TB}}"),
+        ("HBM ratio 300", f"{cap['site_300_to_b300_hbm']:.2f}"),
+        ("HBM ratio 600", f"{cap['site_600_to_b300_hbm']:.2f}"),
+        ("face area", f"{int(g['active_face_area_mm2']):,}".replace(",", "{,}") + f"{g['active_face_area_mm2'] % 1:.1f}"[1:] + "~\\mathrm{mm^2}"),
+        ("published gross", f"{cap['published_gross_PB']:.4f}~PB"),
+        ("published net", f"{cap['published_net_PB']:.4f}~PB"),
+        ("linear density 300", f"{cap['linear_density_300_Gb_mm2']:.3f} Gb/mm$^2$"),
+        ("linear density 600", f"{cap['linear_density_600_Gb_mm2']:.3f} Gb/mm$^2$"),
+        ("linear net 300", f"{cap['linear_net_300_PB']:.4f} PB"),
+        ("linear net 600", f"{cap['linear_net_600_PB']:.4f} PB"),
+        ("petabyte threshold density", f"{cap['net_petabyte_threshold_density_Gb_mm2']:.3f} Gb/mm$^2$"),
+        ("petabyte threshold gross", f"{cap['net_petabyte_threshold_gross_PB']:.4f} PB"),
+        ("dense MACs", f"{op['dense_macs']:,}".replace(",", "{,}")),
+        ("active MACs", f"{op['active_macs']:,}".replace(",", "{,}")),
+        ("work ratio", f"{op['work_ratio']:.4f}"),
+        ("router MAC count", f"{8192*128:,}".replace(",", "{,}")),
+        ("router-inclusive ratio", f"{op['dense_macs']/(op['active_macs']+8192*128):.4f}"),
+        ("expert parameters", f"{op['expert_parameters']:,}".replace(",", "{,}")),
+        ("100-layer GB", f"{op['parameters_100_layers_GB_1byte']:.1f}~GB"),
+        ("reuse at 8TBps", f"{op['required_resident_reuse_at_8TBps_MAC_B']:.0f} MAC/byte"),
+        ("intensity 1byte", f"{op['output_intensity_1byte_MAC_B']:.0f} MAC/byte"),
+        ("intensity 2byte", f"{op['output_intensity_2byte_MAC_B']:.0f} MAC/byte"),
+        ("output BW 1byte", f"{int(op['minimum_output_bandwidth_1byte_TBps']*10)/10:.1f}"),
+        ("output BW 2byte", f"{int(op['minimum_output_bandwidth_2byte_TBps']*10)/10:.1f}"),
+        ("B300 FP8", f"{b['dense_fp8_macs_s']/1e15:.1f}~PetaMAC/s"),
+        ("B300 NVFP4", f"{b['dense_nvfp4_macs_s']/1e15:.1f}~PetaMAC/s"),
+        ("B300 quotient FP8", f"{b['fp8_spec_quotient_fJ_MAC']:.0f}"),
+        ("B300 quotient NVFP4", f"{b['nvfp4_spec_quotient_fJ_MAC']:.3f}"),
+        ("datasheet FP8 quotient", f"{bi['maximum_tgp_w']/(4.5e15/2)*1e15:.2f}"),
+        ("update-product gate", f"{int(b['tenfold_target_PetaMAC_s']*1e15/op['active_macs']/1e8)/10:.1f}" + "\\times10^{9}"),
+        ("expert instances to fill net envelope", sci_tex(cap['published_net_PB']*1e15/(op['expert_parameters']/128), 1)),
+        ("experts per layer at 1000 layers", sci_tex(cap['published_net_PB']*1e15/(op['expert_parameters']/128)/1000, 1)),
+        ("per-expert megabytes", f"{op['expert_parameters']/128/1e6:.2f}~MB"),
+        ("egress bits per second", sci_tex(int(op['minimum_output_bandwidth_1byte_TBps']*10)/10*1e12*8, 1)),
+        ("egress per sample location", sci_tex(int(op['minimum_output_bandwidth_1byte_TBps']*10)/10*1e12*8/r["channels"]["optical_sampling_counts"]["1.0"], 1)),
+        ("datasheet NVFP4 quotient", f"{bi['maximum_tgp_w']/(14e15/2)*1e15:.0f}~fJ/MAC"),
+        ("B300 target", f"{b['tenfold_target_PetaMAC_s']:.0f}~PetaMAC/s"),
+        ("B300 ceiling", f"{b['tenfold_energy_ceiling_fJ_MAC']:.0f}~\\mathrm{{fJ/MAC}}"),
+        ("B300 HBM", f"{bi['hbm_bytes']/1e9:.0f}~GB"),
+        ("B300 bandwidth", f"{bi['hbm_bandwidth_b_s']/1e12:.0f}~TB/s"),
+        ("B300 TGP", f"{bi['maximum_tgp_w']/1e3:.1f}~kW"),
+        ("illustrative transition contribution joules", sci_tex(rel['illustrative_transition_contribution_j'], 5)),
+        ("illustrative transition contribution pJ", f"{fixed_half_up(rel['illustrative_transition_contribution_pj'], 3)}~\\mathrm{{pJ}}"),
+        ("common site-cycle arm", sci_tex(al['site_cycle_arm_s_inv'], 2)),
+        # Reliability sensitivity table rows, generated from computed values.
+        ("sensitivity row 1e-3", f"$10^{{-3}}$ & {sens[0]['lambda']:.4f} & {sens[0]['energy_eV']:.3f} & ${sci_tex(sens[0]['rate_at_1p4kW_s_inv'], 2)}$"),
+        ("sensitivity row 1e-6", f"$10^{{-6}}$ & {sens[1]['lambda']:.4f} & {sens[1]['energy_eV']:.3f} & ${sci_tex(sens[1]['rate_at_1p4kW_s_inv'], 2)}$"),
+        ("sensitivity row 1e-9", f"$10^{{-9}}$ & {sens[2]['lambda']:.4f} & {sens[2]['energy_eV']:.3f} & ${sci_tex(sens[2]['rate_at_1p4kW_s_inv'], 2)}$"),
+        ("sensitivity row union", f"${rel['union_raw_epsilon']*1e10:.5f}\\times10^{{-10}}$ & {sens[3]['lambda']:.4f} & {sens[3]['energy_eV']:.3f} & ${sci_tex(sens[3]['rate_at_1p4kW_s_inv'], 2)}$"),
+        ("sensitivity row 1e-12", f"$10^{{-12}}$ & {sens[4]['lambda']:.4f} & {sens[4]['energy_eV']:.3f} & ${sci_tex(sens[4]['rate_at_1p4kW_s_inv'], 2)}$"),
+        ("sensitivity row 1e-15", f"$10^{{-15}}$ & {sens[5]['lambda']:.4f} & {sens[5]['energy_eV']:.3f} & ${sci_tex(sens[5]['rate_at_1p4kW_s_inv'], 2)}$"),
+        # Raw resource table rows, generated from computed values.
+        ("raw table 1.4 kW", f"1.4 kW & {rows[0]['flux_w_cm2']:.1f} & ${sci_tex(rows[0]['raw_transitions_s_inv'], 2)}$ & {rows[0]['raw_yield_optical_na1']:.1f} & {rows[0]['raw_yield_leaf_columns']:.2f}"),
+        ("raw table 10 kW", f"10 kW & {rows[1]['flux_w_cm2']:.0f} & ${sci_tex(rows[1]['raw_transitions_s_inv'], 2)}$ & {rows[1]['raw_yield_optical_na1']:.0f} & {rows[1]['raw_yield_leaf_columns']:.2f}"),
+        ("raw table 100 kW", f"100 kW & {rows[2]['flux_w_cm2']:.0f} & ${sci_tex(rows[2]['raw_transitions_s_inv'], 2)}$ & {rows[2]['raw_yield_optical_na1']:.0f} & {rows[2]['raw_yield_leaf_columns']:.1f}"),
+        # Capacity table rows, generated from computed values.
+        ("capacity row published", f"28.500 Gb/mm$^2$ & {cap['published_gross_PB']:.4f} PB & {cap['published_net_PB']:.4f} PB"),
+        ("capacity row 300", f"{cap['linear_density_300_Gb_mm2']:.3f} Gb/mm$^2$ & {cap['linear_net_300_PB']/0.9:.4f} PB & {cap['linear_net_300_PB']:.4f} PB"),
+        ("capacity row threshold", f"{cap['net_petabyte_threshold_density_Gb_mm2']:.3f} Gb/mm$^2$ & {cap['net_petabyte_threshold_gross_PB']:.4f} PB & {cap['net_petabyte_threshold_net_PB']:.4f} PB"),
+        ("capacity row 600", f"{cap['linear_density_600_Gb_mm2']:.3f} Gb/mm$^2$ & {cap['linear_net_600_PB']/0.9:.4f} PB & {cap['linear_net_600_PB']:.4f} PB"),
+    ]
+
+
+def verify_manuscript(
+    v: Verifier,
+    r: dict[str, Any],
+    tex_path: Path,
+    readme_path: Path,
+) -> None:
+    print("\nMANUSCRIPT AND PACKAGE SYNCHRONIZATION")
+    text = tex_path.read_text(encoding="utf-8")
+    for name, snippet in manuscript_snippets(r):
+        v.contains(f"manuscript contains {name}", text, snippet)
+
+    v.contains("paper title present", text, PAPER_TITLE)
+    v.contains("subtitle present", text, "From thermodynamic bounds to a candidate cubic computer design")
+    for retired in ("accepted", "audit"):
+        v.absent(f"retired term absent: {retired}", text.lower(), retired)
+    v.contains("abstract opens with the mole question", text, "Would a mole of matter, organized as a machine, deliver a mole's worth of computation? Quantitative")
+    v.contains("Feynman attribution follows in the introduction", text, "Feynman's question about manipulating matter at small scales has a direct computational form")
+    v.contains("accounting boundary standardized", text, "first externally observable boundary")
+    v.contains("same boundary comparison rule present", text, "same completion boundary and acceptance rule")
+    v.contains("operational stream definition present", text, "physically distinguishable, separately schedulable update channel")
+    v.contains("statistical-independence clarification present", text, "does not mean statistical independence")
+    v.contains("common-normalization contribution stated", text, "The contribution is the common normalization")
+    v.contains("scaling result demoted to corollary", text, r"\begin{corollary}[Compact surface-limited families]")
+    v.contains("dark-state fraction defined before result", text, "Define $D_\\tau(L)$ as the fraction")
+    v.contains("serial inactive fraction defined before result", text, "define $D_{\\mathrm{inst}}$ as the instantaneous fraction")
+    v.equal("three proposition environments", text.count(r"\begin{proposition}"), 3)
+    v.equal("one corollary environment", text.count(r"\begin{corollary}"), 1)
+    v.contains("illustrative energy symbol present", text, r"\Eunorm=m_u\Eraw")
+    v.contains("illustrative energy caveat present", text, "not asserted as a physical lower bound")
+    v.contains("resident-touch intensity stated", text, "one MAC per resident byte")
+    v.absent("raw resource ladder removed", text, "fig:ladder")
+    v.contains("resource conversion table present", text, "Conversion from inventories to effective work")
+    v.contains("cube labeled object of study", text, "object of study and measurement target")
+    v.contains("decisive conclusion present", text, "This paper does not demonstrate a molar-scale accelerator")
+    v.contains("verification limitations stated", text, "does not verify cited source data or physical realization")
+    v.contains("verification script referenced generically", text, "accompanying verification script")
+    v.contains("code availability statement present", text, "A verification script is published alongside this manuscript")
+    for filename in ("verify.py", "results.json", "README.md", "paper.tex", "paper.pdf", "v4.0"):
+        v.absent(f"no package filename in manuscript: {filename}", text, filename)
+    v.absent("old internal script filename absent", text, "ai_clean")
+    v.absent("mole title retired", text, "Computing with a Mole of Matter")
+    v.absent("old v2 title absent", text, "Effective-Work Bounds for Compact Physical Computers")
+    v.absent("no Unicode em dash", text, chr(0x2014))
+    v.absent("no LaTeX em dash token", text, "-" * 3)
+    v.contains("AI disclosure present", text, "AI tools were used for drafting and typesetting.")
+    v.absent("appendix macro removed", text, "\\appendix")
+    v.absent("appendix headings removed", text, "\\section*{Appendix")
+
+    for phrase in (
+        "additionally",
+        "serves as",
+        "stands as",
+        "pivotal",
+        "underscores",
+        "showcases",
+        "highlighting",
+        "emphasizing",
+        "enhancing",
+        "delve",
+        "tapestry",
+        "testament",
+        "The design rule is:",
+        "The shortest experimental route is:",
+    ):
+        v.absent(f"AI-style phrase absent: {phrase}", text.lower(), phrase.lower())
+    v.absent("no rather-than contrast", text.lower(), "rather than")
+    v.absent("no inline bold item headers", text, r"\item \textbf")
+    v.absent("no prose bold headers", text, r"\noindent\textbf")
+    v.equal("common-normalization sentence appears once", text.count("The contribution is the common normalization"), 1)
+    v.true("illustrative wording not overused", text.lower().count("illustrative") <= 12, str(text.lower().count("illustrative")))
+
+    labels = re.findall(r"\\label\{([^}]+)\}", text)
+    v.equal("all LaTeX labels unique", len(labels), len(set(labels)))
+    refs = re.findall(r"\\(?:eqref|ref)\{([^}]+)\}", text)
+    missing = sorted(set(refs) - set(labels))
+    v.equal("all internal references resolve in source", missing, [])
+
+    if readme_path.exists():
+        readme = readme_path.read_text(encoding="utf-8")
+        for snippet in (
+            "Script for confirming the math in the paper.",
+            "python3 verify.py",
+            "paper.tex",
+        ):
+            v.contains(f"README contains {snippet}", readme, snippet)
+    else:
+        v.true("README exists", False, str(readme_path))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--tex",
+        type=Path,
+        default=Path(__file__).with_name("paper.tex"),
+        help="LaTeX source to check for synchronized displayed values",
+    )
+    parser.add_argument(
+        "--json",
+        type=Path,
+        default=Path(__file__).with_name("results.json"),
+        help="path for the computed result manifest",
+    )
+    parser.add_argument(
+        "--readme",
+        type=Path,
+        default=Path(__file__).with_name("README.md"),
+        help="README file to check for package consistency",
+    )
+    args = parser.parse_args(argv)
+
+    verifier = Verifier()
+    results = build_results()
+
+    print("STRICT NUMERICAL VERIFICATION")
+    # Sanity check: a zero result must not pass for a small expected value.
+    verifier.true(
+        "strict tolerance rejects zero for union epsilon",
+        not math.isclose(0.0, results["reliability"]["union_raw_epsilon"], rel_tol=1e-11, abs_tol=0.0),
+    )
+    verifier.true(
+        "strict tolerance rejects zero for illustrative transition contribution",
+        not math.isclose(0.0, results["reliability"]["illustrative_transition_contribution_j"], rel_tol=1e-11, abs_tol=0.0),
+    )
+
+    verifier.equal("package version metadata", results["metadata"]["package_version"], PACKAGE_VERSION)
+    verifier.equal("paper title metadata", results["metadata"]["paper_title"], PAPER_TITLE)
+    verify_formulae(verifier, results)
+    verify_bounds(verifier)
+
+    if args.tex.exists():
+        verify_manuscript(verifier, results, args.tex, args.readme)
+    else:
+        verifier.true("LaTeX source exists", False, str(args.tex))
+
+    args.json.write_text(json.dumps(results, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    verifier.true("JSON result manifest written", args.json.exists() and args.json.stat().st_size > 0, str(args.json))
+
+    print("\nSUMMARY")
+    print(f"Checks run: {verifier.checks}")
+    if verifier.failures:
+        print("Failures:")
+        for name in verifier.failures:
+            print(f"  - {name}")
+        return 1
+    print("All numerical, identity, property, manuscript, and package-synchronization checks passed.")
+    print("Scope: arithmetic and source synchronization only; no physical validation is implied.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
