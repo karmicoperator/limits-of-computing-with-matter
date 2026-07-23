@@ -816,7 +816,7 @@ def verify_manuscript(
     v.contains("subtitle present", text, "From thermodynamic bounds to a candidate cubic computer design")
     for retired in ("accepted", "audit"):
         v.absent(f"retired term absent: {retired}", text.lower(), retired)
-    v.contains("abstract opens with the mole question", text, "Would a mole of matter, organized as a machine, deliver a mole's worth of computation? Quantitative")
+    v.contains("abstract opens with the mole question", text, "Would a mole of matter, organized as a machine, deliver a mole's worth of computation? Existing answers sit at two extremes")
     v.contains("Feynman attribution follows in the introduction", text, "Feynman's question about manipulating matter at small scales has a direct computational form")
     v.contains("accounting boundary standardized", text, "first externally observable boundary")
     v.contains("same boundary comparison rule present", text, "same completion boundary and acceptance rule")
@@ -835,6 +835,7 @@ def verify_manuscript(
     v.contains("resource conversion table present", text, "Conversion from inventories to effective work")
     v.contains("cube labeled object of study", text, "object of study and measurement target")
     v.contains("decisive conclusion present", text, "This paper does not demonstrate a molar-scale accelerator")
+    v.equal("verdict sentence in abstract and conclusion", text.count("A mole of active matter, organized as a compact irreversible machine, cannot compute like a mole"), 2)
     v.contains("verification limitations stated", text, "does not verify cited source data or physical realization")
     v.contains("verification script referenced generically", text, "accompanying verification script")
     v.contains("code availability statement present", text, "A verification script is published alongside this manuscript")
